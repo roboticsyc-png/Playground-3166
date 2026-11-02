@@ -1,0 +1,101 @@
+# Real robot risks — code status and robot verification
+
+Not robot validated. All enable flags remain false. References below are repository paths and line numbers. Drivetrain and default drive are unchanged; only the added align binding block gains an end/release handoff. Risk identifiers used in HANDOFF: 1 = unknown alliance, 2 = translation vector cap, 5 = freshness grace. Code fixes still require robot validation.
+
+| Risk and evidence | Proposed verification or fix |
+|---|---|
+| Manual drive is field-centric with operator perspective (`src/main/java/frc/robot/RobotContainer.java:55`); align explicitly requests BlueAlliance (`src/main/java/frc/robot/commands/AlignToPegCommand.java:26`). Switching control may surprise the driver. | Check +field X/+field Y commands on blocks, then at low speed; retain blue-origin poses and explicitly document driver perspective transitions. |
+| Operator perspective changes to 180 degrees for red, while disabled or initially unknown (`src/main/java/frc/robot/subsystems/CommandSwerveDrivetrain.java:276`). | **Risk 1 fixed in align code:** injected alliance supplier refuses unknown-alliance startup with zero output and not aligned; blue/red sim converge in the same blue-origin frame. Verify both alliances physically; no second vision flip. |
+| Driver can seed field-centric heading (`src/main/java/frc/robot/RobotContainer.java:224`); Pigeon config is null (`src/main/java/frc/robot/generated/TunerConstants.java:76`). Code alone cannot establish mounting sign or absolute heading correctness. | Verify physical CCW produces positive yaw, verify boot heading and seed effects, then validate blue-field translation after seeding. Existing bindings remain unchanged; the vision heading-reset detector now clears trust on a sampled heading-offset change over 5 degrees. |
+| No software slew limiter appears in the manual drive request (`src/main/java/frc/robot/RobotContainer.java:119`). Profile constraints in `src/main/java/frc/robot/align/AlignController.java:14` limit setpoints; feedback plus feedforward and final clamps do not guarantee bounded output acceleration. | Measure acceleration/current/traction. Consider a shared vector acceleration limiter with an explicit immediate-stop bypass, after bench validation. Sim physical acceleration is hypothetical 3 m/s² and 10 rad/s². |
+| Manual deadbands are 1.084 m/s and approximately 0.471 rad/s (`src/main/java/frc/robot/RobotContainer.java:57`), larger than some/all align outputs. Align has a separate request without those deadbands (`src/main/java/frc/robot/commands/AlignToPegCommand.java:25`). | Keep the requests independent; regression-test that a future shared request cannot swallow fine correction. Check actual module friction at small outputs. |
+| Default drive owns the drivetrain (`src/main/java/frc/robot/RobotContainer.java:117`); align adds that requirement (`src/main/java/frc/robot/commands/AlignToPegCommand.java:40`). The align end/release handoff now retains drivetrain ownership with zero output until sticks enter the existing manual deadband. | Implemented in the added align binding block using pure DriverHandoff policy; verify scheduler interruption and release at low speed. First-test driver rule: release the stick before releasing the align button. |
+| Manual angular rate converts rotations/s to radians/s (`src/main/java/frc/robot/RobotContainer.java:53`); tag translations and alignment use meters/radians. Vision FPGA seconds are converted by drivetrain (`src/main/java/frc/robot/subsystems/CommandSwerveDrivetrain.java:334`). | Check measured tag centers/orientations and camera extrinsics; avoid degree/radian mistakes and timestamp double conversion. |
+| Theoretical speed is 10.84 m/s (`src/main/java/frc/robot/generated/TunerConstants.java:84`), versus align's 1 m/s translation norm cap and pi rad/s (`src/main/java/frc/robot/Constants.java:129`). **Risk 2 fixed in align code:** combined xy output is scaled to preserve direction at the norm cap; diagonal tests check every step. | Measure actual speed scale, wheel radius/gearing, and stopping distance; validate the norm cap on robot. Do not assume the generated theoretical speed is measured performance. |
+| MegaTag2 orientation comes from fused pose and chassis yaw rate (`src/main/java/frc/robot/vision/VisionSubsystem.java:46`, `:54`); vision theta standard deviation is effectively infinite (`src/main/java/frc/robot/Constants.java:100`). Bad gyro heading may therefore corrupt vision translation without vision correcting heading. | Validate gyro heading, camera extrinsics, spin rejection and blue frame independently; log raw/accepted poses. A 0.5 m translation jump gate is now implemented in vision code; tune on robot before enabling fusion. |
+| All known-layout frames may fuse, including non-pegs (`src/main/java/frc/robot/vision/VisionSubsystem.java:61`). Correct IDs do not guarantee correct pose; **Pose-jump fixed in vision code:** pure filter rejects translation differences over 0.5 m from the current estimate before fusion/freshness updates after bootstrap. On each enable, after deferring the first enabled loop for trigger scheduling, the first otherwise valid frame may bootstrap only while align is not scheduled: two distinct layout tags or five consecutive same-ID single-tag readings with pairwise translation spread <= 0.05 m, distToCamera < 2.0 m and ambiguity < 0.2. Reset preserves gyro heading. Scheduled alignment always uses the normal gate/fusion and leaves bootstrap pending. | Measure every layout pose and validate Limelight map consistency; the threshold is a starting guess, not measured, tune on robot. Delayed frames are compared with the current estimate, so real latency/motion may reject good frames. Sim pose-jump recovery is not proof against sustained estimator corruption. |
+| Freshness grace is 0.5 s (`src/main/java/frc/robot/Constants.java:140`): motion may continue during this grace, then zero is commanded on the first expired update. Physical stopping takes longer. | **Risk 5 remains open, to be timed on the real robot:** measure capture/delivery age, the 0.5 s grace, and braking distance; reduce grace/caps if necessary. Test disappearance at close range with an e-stop operator. |
+
+There is no elevator subsystem in this repository. High/unhomed scales in the test are hypothetical post-controller translation caps only; they are not a production interlock.
+
+The headless test runs the actual profiled PID/state logic at 50 Hz with a seeded noise/dropout camera model, 60 ms latency and a 100-degree horizontal FOV. Odometry propagation/latency compensation is idealized and is not CTRE estimator simulation. It omits wheel slip, module dynamics, collisions, camera mounting occlusion, sustained pose bias, and network/scheduler jitter. The empty deployment layout must remain empty until measurements exist. IDs 4 and 8 are inferred, not field confirmed.
+
+Changes vs 3f15fcf: AlignController now latches POSE_RESET and zero output when consecutive estimator translation/heading deltas exceed previous commanded speed * dt plus POSE_DISCONTINUITY_M (0.5 m) / POSE_DISCONTINUITY_RAD (20 degrees). These margins and the single-tag distance/ambiguity limits are starting guesses, not measured, tune on robot. No reset counter is available through our allowed code: small resets within margins, long scheduler gaps and transient changes between samples can evade detection. Verify external resetPose and heading seeding on blocks while align runs, including after aligned, and confirm zero request plus NOT aligned. Sim forced reset verifies software output, not physical braking.
+
+Single-tag bootstrap trusts camera ambiguity/distance and layout identity; validate RawFiducial quality, extrinsics and map before enabling. Test trigger held through enable and confirm no bootstrap while scheduled. The first enabled loop deliberately fuses nothing so trigger scheduling can establish the inhibit. Handoff dashboard keys Align/HandoffHoldingZero and Align/HandoffReason expose the zero hold; verify clearing on neutral, cancellation and disable. Physical driver/scheduler and CTRE reset behavior remain unvalidated.
+
+Changes vs bb67c3f: Pose trust starts false and clears after more than POSE_TRUST_MAX_DISABLE_S (5.0 s) disabled, evaluated both while disabled and on re-enable using injected timestamps. Short disables preserve trust. Alignment refuses startup with POSE_UNTRUSTED until a successful bootstrap reset; Align/PoseTrusted reports this gate. A normal gate-passing reading before reset cannot grant trust. A held trigger at boot or after trust loss may refuse and require release/repress after bootstrap; a short auto-to-teleop disable keeps trust. Validate that operator sequence on blocks.
+
+Single-tag reset requires five consecutive same-ID validated exposures with maximum pairwise translation spread <= 0.05 m. The frame count and spread are starting guesses, not measured, tune on robot. Candidates are withheld from fusion while collecting. Rejected frames, ID changes, disable/enable and scheduled align clear the window; duplicate timestamps leave it unchanged, so camera cadence/dropouts may delay initialization. Measure actual camera cadence and stationary spread before tuning. Consistent camera/map bias can still pass this test; stability does not prove geometric accuracy. During align, single-tag frames retain the normal jump gate and never reset. Recheck short-disable trust retention, long-disable trust clearing, successful two-tag/stable-single reset, refused zero output, and subsequent press after bootstrap on the robot.
+
+
+Pose-trust lifetime revision: POSE_TRUST_MAX_DISABLE_S = 5.0 is a starting guess, not measured, tune on robot. A short auto-to-teleop disable preserves trust and allows alignment without re-bootstrap; motion or estimator changes during that interval can leave stale trust. On blocks, test 1–3 s and >5 s disables, including remaining disabled past the threshold. Confirm long-disable refusal, jump rejection clearing, and POSE_RESET end clearing on Align/PoseTrusted. Only bootstrap restores trust after loss. The first enabled periodic still defers fusion for held-trigger scheduling. Normal frame rejection and normal align completion retain trust. Sim and unit tests verify software policy only; real timing, disabled motion and estimator behavior remain unmeasured.
+
+
+Running trust-loss revision: alignment rechecks live pose trust each cycle, clears aligned immediately on trust loss (including before execute), and ends POSE_UNTRUSTED with zero output. Align/EndReason preserves the terminal reason; Align/TrustDrops counts true-to-false transitions in the vision trust tracker, including jump rejection and long-disable expiry, without counting repeated clears. Verify these keys on blocks when injecting a bad pose during motion and after alignment. Recovery requires bootstrap and a new trigger press; physical braking and real camera/estimator timing remain unverified.
+
+Every align end now schedules the same DriverHandoff hold-zero command in our ALIGN_ENABLED block, including self-completion while the trigger remains held. There is no separate release scheduling path. Scheduler regression confirms drivetrain ownership, no default-drive execution with off-center sticks, no held-trigger restart, no extra handoff on later release, and default-drive resumption after neutral. On blocks, verify timeout, vision loss, trust loss and trigger release with sticks displaced, followed by neutral and release/repress. All switches remain false and deployment tags empty. Full validation: **53 tests passed**; separate sim **4 tests / 20 scenarios**, including `trust drop mid-align` with zero false alignment/cap violations. Zero software requests do not establish a safe stopping distance.
+
+
+Current per-camera policy supersedes the single-jump clearing descriptions above:
+VISION_TRUST_DROP_FRAMES = 3 is a starting guess, not measured, tune on robot.
+Every jump-rejected frame remains excluded from fusion, but one or two such exposures
+retain trust and allow alignment to continue on odometry. Three from the same camera
+without an intervening fused frame from that camera drop trust; other cameras do not
+combine counts. Duplicates neither advance nor reset the count. Camera cadence therefore
+controls the delay before stopping, and good frames from another camera do not clear a
+bad camera's streak. Measure that delay and braking distance on robot, including alternating
+cameras and recovery exposures. Boot, long-disable and POSE_RESET clearing are unchanged;
+running loss still ends POSE_UNTRUSTED with zero output and increments TrustDrops once.
+Full build/test: **56 tests passed**; separate sim: **4 tests / 20 scenarios passed**.
+Only changed metric: mid-align trust-drop final xy 0.863 -> 0.823 m (drop at 0.84 s).
+All switches remain false, deploy tags empty; no robot validation or deployment.
+
+Current scheduler validation: direct scheduling from align end failed the release
+case by allowing default drive to execute during the handoff. The shared
+DriverHandoff.wireEnd now arms an enabled-only Trigger from the shared
+AlignEndCommand end callback. Its next poll checks !align.isScheduled() before
+scheduling the hold. HAL/real CommandScheduler tests pass release, held-button
+self-completion and disable. Off-center sticks retain the drivetrain with no default
+execution; neutral sticks resume default. Disable starts no handoff and executes no
+drive commands. Physical stopping distance and actual controller inputs still need
+robot validation. Tests clean scheduler registrations/button loops and simulated DS.
+
+Per-camera `Align/JumpRejects/<camera>` dashboard values are running totals of fresh
+jump-rejected exposures, independent of consecutive trust-drop counts. Duplicates
+never increment; accepted frames and trust resets do not erase totals. Use these to
+observe jump frequency during commissioning. Pure counter regression and full build
+pass: 59 tests, zero failures/errors/skips. Pose-trust policy remains unchanged,
+all three switches false, deployment tags empty. No deployment or robot validation.
+
+
+## Phoenix 26 heading seed finding and detector
+The repository uses Phoenix 6 **26.1.3**. Inspection of its cached `wpiapi-java-26.1.3.jar`
+with `javap -c com.ctre.phoenix6.swerve.SwerveDrivetrain` confirms that
+`seedFieldCentric()` calls `seedFieldCentric(Rotation2d.kZero)`, whose body calls
+`SwerveJNI.JNI_SeedFieldCentric` with the drivetrain ID and angle radians.
+The [CTRE Phoenix 26 Java javadoc](https://api.ctr-electronics.com/phoenix6/stable/java/com/ctre/phoenix6/swerve/SwerveDrivetrain.html#seedFieldCentric())
+specifies that this resets robot pose ROTATION to zero from operator perspective,
+equivalent to `resetRotation(rotation.plus(getOperatorForwardDirection()))` for the overload.
+Translation is unchanged. It does **not** change operator perspective;
+`setOperatorPerspectiveForward` does that. Thus blue zero perspective seeds to field zero;
+red operator forward can seed to 180 degrees. RawHeading is raw gyro yaw without seed offset,
+while Pose is the fused estimate. A seed can invalidate field heading even with no translation
+jump, and before the next align command starts.
+
+The detector compares the two wrapped consecutive heading deltas every vision periodic,
+using the same state snapshot. More than 5 degrees difference clears trust through the existing
+tracker (Align/TrustDrops); a running align ends POSE_UNTRUSTED with zero output that cycle.
+Our own bootstrap reset loops are exempt and re-baseline afterward, including any heading
+change over threshold. First sample only baselines. Threshold comment: starting guess,
+not measured, tune on robot. Vision theta std dev is effectively infinite (9999999 radians),
+so fusion is assumed not to move heading materially. Heading fusion would require revisiting
+this assumption. Subthreshold, between-sample canceling and pre-baseline resets remain undetectable.
+
+On blocks, turn 90 degrees, seed, confirm RawHeading is unchanged and Pose rotation changes,
+Align/PoseTrusted becomes false and Align/TrustDrops advances once. Test seeding before align
+and during running/previously aligned operation, then successful bootstrap and a fresh align
+press. Check +/-180 crossings, physical turns, and bootstrap exemption. Unit tests and the
+21-scenario headless sim verify software behavior only; real Phoenix timing and braking remain
+unvalidated. Build/test: 64 passed; separate sim rerun: 4 tests passed. All switches false,
+deployment tags empty; drive/control and RobotContainer bindings untouched.
